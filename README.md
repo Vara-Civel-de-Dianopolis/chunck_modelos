@@ -5,3 +5,4 @@
 <br>pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
 <br>pip install mysql-connector-python
 <br>pip install PyPDF2 python-docx
+<br>pip install google-generativeai mysql-connector-python PyPDF2 python-docx
