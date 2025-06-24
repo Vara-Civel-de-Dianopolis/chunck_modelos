@@ -10,6 +10,8 @@ import logging
 import hashlib
 from pathlib import Path
 import time
+import json
+import google.generativeai as genai
 
 # Configuração de logging
 logging.basicConfig(
@@ -18,12 +20,255 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class SlidingWindowChunker:
-    """Classe para implementar chunking com janela deslizante"""
+class LegalDocumentChapterDetector:
+    """Classe para detectar e separar capítulos em documentos jurídicos usando Gemini AI"""
+    
+    def __init__(self, api_key: str):
+        """
+        Inicializa o detector de capítulos
+        
+        Args:
+            api_key: Chave da API do Google Gemini
+        """
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        
+    def detect_chapters(self, text: str, document_name: str) -> List[Dict]:
+        """
+        Detecta capítulos em documentos jurídicos usando IA
+        
+        Args:
+            text: Texto completo do documento
+            document_name: Nome do documento para contexto
+            
+        Returns:
+            Lista de capítulos com suas posições e conteúdo
+        """
+        try:
+            # Prompt especializado para documentos jurídicos
+            prompt = f"""
+            Analise o seguinte documento jurídico e identifique TODOS os capítulos, seções e subdivisões estruturais.
+            
+            DOCUMENTO: {document_name}
+            
+            INSTRUÇÕES:
+            1. Identifique a estrutura hierárquica completa (Capítulos, Seções, Subseções, etc.)
+            2. Para cada divisão encontrada, forneça:
+               - Título completo
+               - Posição aproximada no texto (caractere inicial)
+               - Tipo (CAPITULO, SECAO, SUBSECAO, etc.)
+               - Nível hierárquico (1, 2, 3, etc.)
+            
+            3. Considere padrões comuns em documentos jurídicos:
+               - "CAPÍTULO I", "CAPÍTULO II", etc.
+               - "Seção I", "Seção II", etc.
+               - "Art.", "Artigo"
+               - "1.", "2.", "3." (numeração)
+               - "a)", "b)", "c)" (alíneas)
+               - "I -", "II -", "III -" (numeração romana)
+               - Títulos em maiúsculas
+               - "DISPOSIÇÕES GERAIS", "DISPOSIÇÕES FINAIS"
+               - "CONSIDERANDO", "FUNDAMENTAÇÃO"
+               - "DISPOSITIVO", "CONCLUSÃO"
+            
+            4. Retorne APENAS um JSON válido no formato:
+            {{
+                "chapters": [
+                    {{
+                        "title": "título completo",
+                        "type": "CAPITULO|SECAO|SUBSECAO|ARTIGO|DISPOSITIVO",
+                        "level": 1,
+                        "start_position": 0,
+                        "content_preview": "primeiras 100 palavras do conteúdo"
+                    }}
+                ]
+            }}
+            
+            TEXTO DO DOCUMENTO:
+            {text[:8000]}...
+            
+            IMPORTANTE: Retorne APENAS o JSON, sem explicações adicionais.
+            """
+            
+            response = self.model.generate_content(prompt)
+            
+            # Tenta extrair JSON da resposta
+            response_text = response.text.strip()
+            
+            # Remove possíveis marcadores de código
+            if response_text.startswith('```json'):
+                response_text = response_text[7:]
+            if response_text.startswith('```'):
+                response_text = response_text[3:]
+            if response_text.endswith('```'):
+                response_text = response_text[:-3]
+            
+            # Parse do JSON
+            try:
+                result = json.loads(response_text)
+                chapters = result.get('chapters', [])
+                
+                # Valida e ajusta as posições dos capítulos
+                validated_chapters = self._validate_and_adjust_chapters(chapters, text)
+                
+                logger.info(f"Detectados {len(validated_chapters)} capítulos no documento {document_name}")
+                return validated_chapters
+                
+            except json.JSONDecodeError as e:
+                logger.warning(f"Erro ao parsear JSON da resposta do Gemini: {e}")
+                logger.debug(f"Resposta recebida: {response_text[:500]}...")
+                
+                # Fallback: detecção baseada em regras
+                return self._fallback_chapter_detection(text)
+                
+        except Exception as e:
+            logger.error(f"Erro na detecção de capítulos com Gemini: {e}")
+            # Fallback: detecção baseada em regras
+            return self._fallback_chapter_detection(text)
+    
+    def _validate_and_adjust_chapters(self, chapters: List[Dict], text: str) -> List[Dict]:
+        """
+        Valida e ajusta as posições dos capítulos detectados
+        
+        Args:
+            chapters: Lista de capítulos detectados
+            text: Texto completo do documento
+            
+        Returns:
+            Lista de capítulos validados
+        """
+        validated_chapters = []
+        text_lower = text.lower()
+        
+        for chapter in chapters:
+            try:
+                title = chapter.get('title', '').strip()
+                if not title:
+                    continue
+                
+                # Busca a posição real do título no texto
+                title_lower = title.lower()
+                
+                # Tenta diferentes variações do título
+                search_variations = [
+                    title_lower,
+                    title_lower.replace(' ', ''),
+                    re.sub(r'[^\w\s]', '', title_lower),
+                    title_lower.split()[0] if title_lower.split() else ''
+                ]
+                
+                found_position = None
+                for variation in search_variations:
+                    if variation and len(variation) > 3:
+                        pos = text_lower.find(variation)
+                        if pos != -1:
+                            found_position = pos
+                            break
+                
+                if found_position is not None:
+                    chapter['start_position'] = found_position
+                    chapter['actual_title'] = title
+                    
+                    # Extrai preview do conteúdo
+                    preview_end = min(found_position + 500, len(text))
+                    chapter['content_preview'] = text[found_position:preview_end].strip()
+                    
+                    validated_chapters.append(chapter)
+                else:
+                    logger.debug(f"Não foi possível localizar o capítulo: {title}")
+                    
+            except Exception as e:
+                logger.warning(f"Erro ao validar capítulo {chapter}: {e}")
+                continue
+        
+        # Ordena capítulos por posição
+        validated_chapters.sort(key=lambda x: x['start_position'])
+        
+        return validated_chapters
+    
+    def _fallback_chapter_detection(self, text: str) -> List[Dict]:
+        """
+        Detecção de capítulos baseada em regras como fallback
+        
+        Args:
+            text: Texto do documento
+            
+        Returns:
+            Lista de capítulos detectados
+        """
+        logger.info("Usando detecção de capítulos baseada em regras (fallback)")
+        
+        chapters = []
+        
+        # Padrões comuns em documentos jurídicos
+        patterns = [
+            # Capítulos
+            (r'(?i)^(CAPÍTULO\s+[IVX]+|CAPÍTULO\s+\d+)[\s\-–—]*(.{0,100}?)(?=\n|\r|$)', 'CAPITULO', 1),
+            (r'(?i)^(CAP\.?\s+[IVX]+|CAP\.?\s+\d+)[\s\-–—]*(.{0,100}?)(?=\n|\r|$)', 'CAPITULO', 1),
+            
+            # Seções
+            (r'(?i)^(SEÇÃO\s+[IVX]+|SEÇÃO\s+\d+)[\s\-–—]*(.{0,100}?)(?=\n|\r|$)', 'SECAO', 2),
+            (r'(?i)^(SEÇ\.?\s+[IVX]+|SEÇ\.?\s+\d+)[\s\-–—]*(.{0,100}?)(?=\n|\r|$)', 'SECAO', 2),
+            
+            # Artigos
+            (r'(?i)^(ART\.?\s+\d+|ARTIGO\s+\d+)[\s\-–—]*(.{0,100}?)(?=\n|\r|$)', 'ARTIGO', 3),
+            
+            # Disposições especiais
+            (r'(?i)^(DISPOSIÇÕES?\s+GERAIS|DISPOSIÇÕES?\s+FINAIS|DISPOSIÇÕES?\s+TRANSITÓRIAS)(.{0,50}?)(?=\n|\r|$)', 'DISPOSITIVO', 1),
+            
+            # Considerandos e fundamentação
+            (r'(?i)^(CONSIDERANDO|FUNDAMENTAÇÃO|MOTIVAÇÃO)(.{0,50}?)(?=\n|\r|$)', 'FUNDAMENTACAO', 1),
+            
+            # Dispositivo e conclusão
+            (r'(?i)^(DISPOSITIVO|CONCLUSÃO|DECISÃO)(.{0,50}?)(?=\n|\r|$)', 'DISPOSITIVO', 1),
+            
+            # Títulos em maiúsculas (genérico)
+            (r'^([A-ZÁÉÍÓÚÂÊÎÔÛÀÈÌÒÙÃÕÇ\s]{10,80})(?=\n|\r|$)', 'TITULO', 2),
+        ]
+        
+        lines = text.split('\n')
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+                
+            for pattern, chapter_type, level in patterns:
+                match = re.match(pattern, line, re.MULTILINE)
+                if match:
+                    # Calcula posição no texto original
+                    start_pos = sum(len(lines[j]) + 1 for j in range(i))
+                    
+                    title = match.group(1)
+                    if len(match.groups()) > 1 and match.group(2):
+                        title += " " + match.group(2).strip()
+                    
+                    title = title.strip()
+                    
+                    # Evita duplicatas próximas
+                    if not any(abs(ch['start_position'] - start_pos) < 50 for ch in chapters):
+                        chapter = {
+                            'title': title,
+                            'type': chapter_type,
+                            'level': level,
+                            'start_position': start_pos,
+                            'content_preview': line[:200]
+                        }
+                        chapters.append(chapter)
+                    break
+        
+        # Ordena por posição
+        chapters.sort(key=lambda x: x['start_position'])
+        
+        logger.info(f"Detecção por regras encontrou {len(chapters)} capítulos")
+        return chapters
+
+class LegalDocumentChunker:
+    """Classe especializada para chunking de documentos jurídicos por capítulos"""
     
     def __init__(self, chunk_size: int = 1000, overlap: int = 200):
         """
-        Inicializa o chunker com janela deslizante
+        Inicializa o chunker para documentos jurídicos
         
         Args:
             chunk_size: Tamanho de cada chunk em caracteres
@@ -32,58 +277,145 @@ class SlidingWindowChunker:
         self.chunk_size = chunk_size
         self.overlap = overlap
         
-    def create_chunks(self, text: str) -> List[Dict]:
+    def create_chapter_chunks(self, text: str, chapters: List[Dict]) -> List[Dict]:
         """
-        Cria chunks usando técnica de janela deslizante
+        Cria chunks organizados por capítulos
         
         Args:
-            text: Texto para ser dividido em chunks
+            text: Texto completo do documento
+            chapters: Lista de capítulos detectados
             
         Returns:
-            Lista de dicionários contendo informações dos chunks
+            Lista de chunks organizados por capítulos
         """
-        if not text or len(text) == 0:
-            return []
+        all_chunks = []
         
+        if not chapters:
+            # Se não há capítulos, trata como um único capítulo
+            logger.warning("Nenhum capítulo detectado, processando como documento único")
+            chapter_chunks = self._create_chunks_for_chapter(
+                text, 
+                {
+                    'title': 'DOCUMENTO COMPLETO',
+                    'type': 'DOCUMENTO',
+                    'level': 1,
+                    'start_position': 0
+                },
+                0,
+                len(text)
+            )
+            all_chunks.extend(chapter_chunks)
+            return all_chunks
+        
+        # Processa cada capítulo
+        for i, chapter in enumerate(chapters):
+            start_pos = chapter['start_position']
+            
+            # Determina fim do capítulo (início do próximo ou fim do documento)
+            if i + 1 < len(chapters):
+                end_pos = chapters[i + 1]['start_position']
+            else:
+                end_pos = len(text)
+            
+            # Extrai texto do capítulo
+            chapter_text = text[start_pos:end_pos].strip()
+            
+            if chapter_text:
+                chapter_chunks = self._create_chunks_for_chapter(
+                    chapter_text, 
+                    chapter, 
+                    start_pos,
+                    end_pos
+                )
+                all_chunks.extend(chapter_chunks)
+        
+        return all_chunks
+    
+    def _create_chunks_for_chapter(self, chapter_text: str, chapter_info: Dict, 
+                                  chapter_start: int, chapter_end: int) -> List[Dict]:
+        """
+        Cria chunks para um capítulo específico
+        
+        Args:
+            chapter_text: Texto do capítulo
+            chapter_info: Informações do capítulo
+            chapter_start: Posição inicial do capítulo no documento
+            chapter_end: Posição final do capítulo no documento
+            
+        Returns:
+            Lista de chunks do capítulo
+        """
         chunks = []
+        
+        if len(chapter_text) <= self.chunk_size:
+            # Capítulo cabe em um único chunk
+            chunk = {
+                'chunk_index': 0,
+                'content': chapter_text,
+                'chunk_size': len(chapter_text),
+                'start_position': 0,
+                'end_position': len(chapter_text),
+                'overlap_size': 0,
+                'chapter_title': chapter_info['title'],
+                'chapter_type': chapter_info['type'],
+                'chapter_level': chapter_info['level'],
+                'absolute_start_position': chapter_start,
+                'absolute_end_position': chapter_end,
+                'is_chapter_complete': True
+            }
+            chunks.append(chunk)
+            return chunks
+        
+        # Divide capítulo em múltiplos chunks
         start = 0
         chunk_index = 0
         
-        while start < len(text):
-            # Define o fim do chunk
-            end = min(start + self.chunk_size, len(text))
+        while start < len(chapter_text):
+            end = min(start + self.chunk_size, len(chapter_text))
             
-            # Extrai o conteúdo do chunk
-            chunk_content = text[start:end]
+            # Tenta quebrar em uma frase completa para documentos jurídicos
+            chunk_content = chapter_text[start:end]
             
-            # Tenta quebrar em uma palavra completa se não for o último chunk
-            if end < len(text):
-                # Procura pelo último espaço para não cortar palavras
-                last_space = chunk_content.rfind(' ')
-                if last_space > self.chunk_size * 0.8:  # Só ajusta se não reduzir muito o chunk
-                    end = start + last_space
-                    chunk_content = text[start:end]
+            if end < len(chapter_text):
+                # Procura por quebras naturais em documentos jurídicos
+                break_points = [
+                    chunk_content.rfind('.'),
+                    chunk_content.rfind(';'),
+                    chunk_content.rfind(':'),
+                    chunk_content.rfind('\n'),
+                    chunk_content.rfind(' ')
+                ]
+                
+                best_break = max([bp for bp in break_points if bp > self.chunk_size * 0.7])
+                if best_break > 0:
+                    end = start + best_break + 1
+                    chunk_content = chapter_text[start:end]
             
-            # Cria o dicionário do chunk
-            chunk_info = {
+            chunk = {
                 'chunk_index': chunk_index,
                 'content': chunk_content.strip(),
                 'chunk_size': len(chunk_content.strip()),
                 'start_position': start,
                 'end_position': end,
-                'overlap_size': self.overlap if chunk_index > 0 else 0
+                'overlap_size': self.overlap if chunk_index > 0 else 0,
+                'chapter_title': chapter_info['title'],
+                'chapter_type': chapter_info['type'],
+                'chapter_level': chapter_info['level'],
+                'absolute_start_position': chapter_start + start,
+                'absolute_end_position': chapter_start + end,
+                'is_chapter_complete': False
             }
             
-            chunks.append(chunk_info)
+            chunks.append(chunk)
             
-            # Move para a próxima posição com sobreposição
+            # Move para próxima posição com overlap
             start = end - self.overlap
             chunk_index += 1
             
             # Evita chunks muito pequenos no final
-            if len(text) - start < self.chunk_size * 0.3:
+            if len(chapter_text) - start < self.chunk_size * 0.3:
                 break
-                
+        
         return chunks
 
 class SmartLocalFileProcessor:
@@ -480,8 +812,8 @@ class EnhancedTextExtractor:
             logger.warning(f"Tipo de arquivo não suportado: {file_extension}")
             return ""
 
-class SmartDatabaseManager:
-    """Classe inteligente para gerenciar operações do banco de dados MySQL com detecção de mudanças"""
+class LegalDatabaseManager:
+    """Classe especializada para gerenciar banco de dados de documentos jurídicos"""
     
     def __init__(self, host: str, database: str, user: str, password: str, port: int = 3306):
         """
@@ -532,17 +864,12 @@ class SmartDatabaseManager:
             file_info: Informações do arquivo
             
         Returns:
-            Dicionário com status do arquivo:
-            - exists: Se o arquivo existe no banco
-            - needs_update: Se precisa ser atualizado
-            - document_id: ID do documento (se existir)
-            - last_hash: Hash anterior (se existir)
-            - last_modified: Data da última modificação no banco
+            Dicionário com status do arquivo
         """
         try:
             cursor = self.connection.cursor()
             
-            # Busca arquivo pelo caminho (mais confiável que hash)
+            # Busca arquivo pelo caminho
             query = """
             SELECT id, file_hash, modification_timestamp, last_processed, content_length
             FROM documents 
@@ -561,7 +888,7 @@ class SmartDatabaseManager:
                 
                 needs_update = (
                     stored_hash != current_hash or 
-                    abs(stored_timestamp - current_timestamp) > 1  # Tolerância de 1 segundo
+                    abs(stored_timestamp - current_timestamp) > 1
                 )
                 
                 return {
@@ -596,12 +923,14 @@ class SmartDatabaseManager:
             if cursor:
                 cursor.close()
             
-    def insert_or_update_document(self, file_info: Dict, document_id: Optional[int] = None) -> Optional[int]:
+    def insert_or_update_document(self, file_info: Dict, chapters: List[Dict], 
+                                 document_id: Optional[int] = None) -> Optional[int]:
         """
         Insere ou atualiza informações do documento na tabela documents
         
         Args:
             file_info: Dicionário com informações do arquivo
+            chapters: Lista de capítulos detectados
             document_id: ID do documento existente (para update)
             
         Returns:
@@ -616,7 +945,7 @@ class SmartDatabaseManager:
                 UPDATE documents 
                 SET file_name = %s, file_type = %s, file_size = %s, 
                     content_length = %s, file_hash = %s, modification_timestamp = %s,
-                    last_processed = CURRENT_TIMESTAMP, status = %s
+                    chapters_count = %s, last_processed = CURRENT_TIMESTAMP, status = %s
                 WHERE id = %s
                 """
                 
@@ -627,6 +956,7 @@ class SmartDatabaseManager:
                     file_info.get('content_length', 0),
                     file_info['file_hash'],
                     file_info['modification_timestamp'],
+                    len(chapters),
                     'processed',
                     document_id
                 )
@@ -634,7 +964,7 @@ class SmartDatabaseManager:
                 cursor.execute(query, values)
                 self.connection.commit()
                 
-                logger.info(f"Documento atualizado: {file_info['name']}")
+                logger.info(f"Documento atualizado: {file_info['name']} ({len(chapters)} capítulos)")
                 return document_id
                 
             else:
@@ -642,8 +972,8 @@ class SmartDatabaseManager:
                 query = """
                 INSERT INTO documents 
                 (file_path, file_name, file_type, file_size, content_length, 
-                 file_hash, modification_timestamp, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                 file_hash, modification_timestamp, chapters_count, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
                 
                 values = (
@@ -654,13 +984,14 @@ class SmartDatabaseManager:
                     file_info.get('content_length', 0),
                     file_info['file_hash'],
                     file_info['modification_timestamp'],
+                    len(chapters),
                     'processed'
                 )
                 
                 cursor.execute(query, values)
                 self.connection.commit()
                 
-                logger.info(f"Novo documento inserido: {file_info['name']}")
+                logger.info(f"Novo documento inserido: {file_info['name']} ({len(chapters)} capítulos)")
                 return cursor.lastrowid
                 
         except Error as e:
@@ -670,14 +1001,70 @@ class SmartDatabaseManager:
         finally:
             if cursor:
                 cursor.close()
-                
-    def insert_chunks(self, document_id: int, chunks: List[Dict]) -> bool:
+    
+    def insert_chapters(self, document_id: int, chapters: List[Dict]) -> bool:
         """
-        Insere chunks na tabela document_chunks (remove chunks antigos primeiro)
+        Insere informações dos capítulos na tabela document_chapters
         
         Args:
             document_id: ID do documento
-            chunks: Lista de chunks
+            chapters: Lista de capítulos
+            
+        Returns:
+            True se sucesso, False se erro
+        """
+        try:
+            cursor = self.connection.cursor()
+            
+            # Remove capítulos existentes do documento
+            cursor.execute("DELETE FROM document_chapters WHERE document_id = %s", (document_id,))
+            
+            if not chapters:
+                self.connection.commit()
+                return True
+            
+            # Insere novos capítulos
+            query = """
+            INSERT INTO document_chapters 
+            (document_id, chapter_index, title, chapter_type, level, 
+             start_position, end_position, content_preview)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            
+            chapter_values = []
+            for i, chapter in enumerate(chapters):
+                chapter_values.append((
+                    document_id,
+                    i,
+                    chapter['title'],
+                    chapter['type'],
+                    chapter['level'],
+                    chapter['start_position'],
+                    chapter.get('end_position', chapter['start_position'] + 1000),
+                    chapter.get('content_preview', '')[:500]  # Limita preview
+                ))
+            
+            cursor.executemany(query, chapter_values)
+            self.connection.commit()
+            
+            logger.info(f"Inseridos {len(chapters)} capítulos para documento {document_id}")
+            return True
+            
+        except Error as e:
+            logger.error(f"Erro ao inserir capítulos: {e}")
+            self.connection.rollback()
+            return False
+        finally:
+            if cursor:
+                cursor.close()
+                
+    def insert_chunks(self, document_id: int, chunks: List[Dict]) -> bool:
+        """
+        Insere chunks organizados por capítulos na tabela document_chunks
+        
+        Args:
+            document_id: ID do documento
+            chunks: Lista de chunks organizados por capítulos
             
         Returns:
             True se sucesso, False se erro
@@ -693,11 +1080,13 @@ class SmartDatabaseManager:
                 logger.warning(f"Nenhum chunk para inserir no documento {document_id}")
                 return True
             
-            # Insere novos chunks em lotes para melhor performance
+            # Insere novos chunks em lotes
             query = """
             INSERT INTO document_chunks 
-            (document_id, chunk_index, content, chunk_size, start_position, end_position, overlap_size)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            (document_id, chunk_index, content, chunk_size, start_position, end_position, 
+             overlap_size, chapter_title, chapter_type, chapter_level, 
+             absolute_start_position, absolute_end_position, is_chapter_complete)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
             
             chunk_values = []
@@ -709,10 +1098,16 @@ class SmartDatabaseManager:
                     chunk['chunk_size'],
                     chunk['start_position'],
                     chunk['end_position'],
-                    chunk['overlap_size']
+                    chunk['overlap_size'],
+                    chunk['chapter_title'],
+                    chunk['chapter_type'],
+                    chunk['chapter_level'],
+                    chunk['absolute_start_position'],
+                    chunk['absolute_end_position'],
+                    chunk['is_chapter_complete']
                 ))
             
-            # Insere em lotes de 100 para evitar problemas de memória
+            # Insere em lotes de 100
             batch_size = 100
             for i in range(0, len(chunk_values), batch_size):
                 batch = chunk_values[i:i + batch_size]
@@ -720,7 +1115,7 @@ class SmartDatabaseManager:
             
             self.connection.commit()
             
-            logger.info(f"Inseridos {len(chunks)} chunks para documento {document_id}")
+            logger.info(f"Inseridos {len(chunks)} chunks organizados por capítulos para documento {document_id}")
             return True
             
         except Error as e:
@@ -778,6 +1173,10 @@ class SmartDatabaseManager:
             cursor.execute("SELECT COUNT(*) FROM documents WHERE status = 'processed'")
             stats['processed_documents'] = cursor.fetchone()[0]
             
+            cursor.execute("SELECT SUM(chapters_count) FROM documents WHERE status = 'processed'")
+            result = cursor.fetchone()
+            stats['total_chapters'] = result[0] if result[0] else 0
+            
             # Estatísticas dos chunks
             cursor.execute("SELECT COUNT(*) FROM document_chunks")
             stats['total_chunks'] = cursor.fetchone()[0]
@@ -788,6 +1187,15 @@ class SmartDatabaseManager:
             stats['min_chunk_size'] = result[1] if result[1] else 0
             stats['max_chunk_size'] = result[2] if result[2] else 0
             
+            # Estatísticas por tipo de capítulo
+            cursor.execute("""
+                SELECT chapter_type, COUNT(*) 
+                FROM document_chunks 
+                GROUP BY chapter_type
+                ORDER BY COUNT(*) DESC
+            """)
+            stats['chunks_by_chapter_type'] = dict(cursor.fetchall())
+            
             # Tipos de arquivo
             cursor.execute("""
                 SELECT file_type, COUNT(*) 
@@ -796,27 +1204,6 @@ class SmartDatabaseManager:
                 ORDER BY COUNT(*) DESC
             """)
             stats['file_types'] = dict(cursor.fetchall())
-            
-            # Documentos processados por data
-            cursor.execute("""
-                SELECT DATE(last_processed) as date, COUNT(*) 
-                FROM documents 
-                WHERE status = 'processed'
-                GROUP BY DATE(last_processed)
-                ORDER BY date DESC
-                LIMIT 7
-            """)
-            stats['processing_by_date'] = dict(cursor.fetchall())
-            
-            # Logs de erro recentes
-            cursor.execute("""
-                SELECT operation, COUNT(*) 
-                FROM processing_logs 
-                WHERE status = 'error' 
-                AND created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-                GROUP BY operation
-            """)
-            stats['recent_errors'] = dict(cursor.fetchall())
             
             return stats
             
@@ -827,23 +1214,25 @@ class SmartDatabaseManager:
             if cursor:
                 cursor.close()
 
-class SmartRAGProcessor:
-    """Classe principal inteligente para processar documentos locais para RAG com detecção de mudanças"""
+class LegalRAGProcessor:
+    """Classe principal para processar documentos jurídicos com detecção de capítulos"""
     
-    def __init__(self, db_config: Dict, documents_folder: str, 
+    def __init__(self, db_config: Dict, documents_folder: str, gemini_api_key: str,
                  chunk_size: int = 1000, overlap: int = 200):
         """
-        Inicializa o processador RAG inteligente
+        Inicializa o processador RAG para documentos jurídicos
         
         Args:
             db_config: Configurações do banco de dados
             documents_folder: Pasta com os documentos
+            gemini_api_key: Chave da API do Google Gemini
             chunk_size: Tamanho dos chunks
             overlap: Sobreposição entre chunks
         """
-        self.db_manager = SmartDatabaseManager(**db_config)
+        self.db_manager = LegalDatabaseManager(**db_config)
         self.file_processor = SmartLocalFileProcessor(documents_folder)
-        self.chunker = SlidingWindowChunker(chunk_size, overlap)
+        self.chapter_detector = LegalDocumentChapterDetector(gemini_api_key)
+        self.chunker = LegalDocumentChunker(chunk_size, overlap)
         self.text_extractor = EnhancedTextExtractor()
         self.documents_folder = documents_folder
         
@@ -852,7 +1241,7 @@ class SmartRAGProcessor:
                          max_depth: Optional[int] = None,
                          show_progress: bool = True) -> Dict:
         """
-        Processa documentos com detecção inteligente de mudanças
+        Processa documentos jurídicos com detecção de capítulos
         
         Args:
             file_types: Tipos de arquivo para processar
@@ -871,10 +1260,12 @@ class SmartRAGProcessor:
             'updated_files': 0,
             'unchanged_files': 0,
             'failed_files': 0,
+            'total_chapters': 0,
             'total_chunks': 0,
             'processing_time': 0,
             'folders_scanned': 0,
             'files_by_type': {},
+            'chapters_by_type': {},
             'errors': []
         }
         
@@ -882,9 +1273,9 @@ class SmartRAGProcessor:
             # Conecta ao banco de dados
             self.db_manager.connect()
             
-            logger.info("Iniciando busca recursiva de arquivos...")
+            logger.info("Iniciando busca recursiva de documentos jurídicos...")
             
-            # Lista arquivos da pasta local com busca recursiva
+            # Lista arquivos da pasta local
             files = self.file_processor.list_files(
                 file_types=file_types, 
                 recursive=recursive,
@@ -900,40 +1291,45 @@ class SmartRAGProcessor:
                 logger.warning("Nenhum arquivo encontrado para processar!")
                 return stats
             
-            logger.info(f"Iniciando processamento inteligente de {len(files)} arquivos...")
+            logger.info(f"Iniciando processamento de {len(files)} documentos jurídicos...")
             
             # Processa cada arquivo
             for i, file_info in enumerate(files, 1):
                 try:
-                    if show_progress and i % 5 == 0:
-                        logger.info(f"Processando arquivo {i}/{len(files)}: {file_info['name']}")
+                    if show_progress and i % 2 == 0:  # Mostra progresso mais frequentemente
+                        logger.info(f"Processando documento {i}/{len(files)}: {file_info['name']}")
                     
                     # Verifica status do arquivo no banco
                     file_status = self.db_manager.check_file_status(file_info)
                     
                     if file_status['exists'] and not file_status['needs_update']:
                         # Arquivo existe e não foi modificado
-                        logger.debug(f"Arquivo inalterado, pulando: {file_info['name']}")
+                        logger.debug(f"Documento inalterado, pulando: {file_info['name']}")
                         stats['unchanged_files'] += 1
                         continue
                     
-                    # Processa arquivo (novo ou modificado)
-                    success = self._process_single_file(file_info, file_status)
+                    # Processa documento (novo ou modificado)
+                    result = self._process_single_document(file_info, file_status)
                     
-                    if success:
+                    if result:
+                        chapters_count, chunks_count = result
+                        
                         if file_status['exists']:
                             stats['updated_files'] += 1
-                            logger.info(f"Arquivo atualizado: {file_info['name']} ({success} chunks)")
+                            logger.info(f"Documento atualizado: {file_info['name']} "
+                                      f"({chapters_count} capítulos, {chunks_count} chunks)")
                         else:
                             stats['new_files'] += 1
-                            logger.info(f"Novo arquivo processado: {file_info['name']} ({success} chunks)")
+                            logger.info(f"Novo documento processado: {file_info['name']} "
+                                      f"({chapters_count} capítulos, {chunks_count} chunks)")
                         
-                        stats['total_chunks'] += success
+                        stats['total_chapters'] += chapters_count
+                        stats['total_chunks'] += chunks_count
                     else:
                         stats['failed_files'] += 1
                         
                 except Exception as e:
-                    error_msg = f"Erro ao processar arquivo {file_info['name']}: {e}"
+                    error_msg = f"Erro ao processar documento {file_info['name']}: {e}"
                     logger.error(error_msg)
                     stats['failed_files'] += 1
                     stats['errors'].append(error_msg)
@@ -949,21 +1345,21 @@ class SmartRAGProcessor:
             
         return stats
     
-    def _process_single_file(self, file_info: Dict, file_status: Dict) -> Optional[int]:
+    def _process_single_document(self, file_info: Dict, file_status: Dict) -> Optional[Tuple[int, int]]:
         """
-        Processa um único arquivo (novo ou modificado)
+        Processa um único documento jurídico
         
         Args:
             file_info: Informações do arquivo
             file_status: Status do arquivo no banco
             
         Returns:
-            Número de chunks criados ou None se erro
+            Tupla com (número de capítulos, número de chunks) ou None se erro
         """
         try:
-            logger.debug(f"Processando arquivo: {file_info['relative_path']}")
+            logger.info(f"Processando documento jurídico: {file_info['relative_path']}")
             
-            # Extrai texto baseado na extensão do arquivo
+            # Extrai texto do documento
             file_extension = file_info['extension'].lower()
             file_path = file_info['path']
             
@@ -980,17 +1376,32 @@ class SmartRAGProcessor:
             # Adiciona informações do conteúdo
             file_info['content_length'] = len(text)
             
+            # Detecta capítulos usando IA
+            logger.info(f"Detectando capítulos em {file_info['name']}...")
+            chapters = self.chapter_detector.detect_chapters(text, file_info['name'])
+            
+            if not chapters:
+                logger.warning(f"Nenhum capítulo detectado em {file_info['name']}")
+            
             # Insere ou atualiza documento no banco
             document_id = self.db_manager.insert_or_update_document(
                 file_info, 
+                chapters,
                 file_status.get('document_id')
             )
             
             if not document_id:
                 return None
             
-            # Cria chunks
-            chunks = self.chunker.create_chunks(text)
+            # Insere informações dos capítulos
+            if chapters:
+                success = self.db_manager.insert_chapters(document_id, chapters)
+                if not success:
+                    logger.error(f"Erro ao inserir capítulos do documento {file_info['name']}")
+            
+            # Cria chunks organizados por capítulos
+            logger.info(f"Criando chunks por capítulos para {file_info['name']}...")
+            chunks = self.chunker.create_chapter_chunks(text, chapters)
             
             if not chunks:
                 self.db_manager.log_processing(
@@ -998,32 +1409,32 @@ class SmartRAGProcessor:
                     f"Nenhum chunk criado para {file_info['name']}"
                 )
                 logger.warning(f"Nenhum chunk criado para {file_info['name']}")
-                return 0
+                return (len(chapters), 0)
             
-            # Insere chunks no banco (remove chunks antigos automaticamente)
+            # Insere chunks no banco
             success = self.db_manager.insert_chunks(document_id, chunks)
             
             if success:
                 operation = 'update' if file_status['exists'] else 'insert'
                 self.db_manager.log_processing(
-                    document_id, f'chunking_{operation}', 'success',
-                    f"Criados {len(chunks)} chunks para {file_info['name']}"
+                    document_id, f'legal_processing_{operation}', 'success',
+                    f"Processado documento jurídico: {len(chapters)} capítulos, {len(chunks)} chunks"
                 )
-                return len(chunks)
+                return (len(chapters), len(chunks))
             else:
                 return None
                 
         except Exception as e:
-            logger.error(f"Erro no processamento do arquivo {file_info['name']}: {e}")
+            logger.error(f"Erro no processamento do documento {file_info['name']}: {e}")
             if 'document_id' in locals():
                 self.db_manager.log_processing(
-                    document_id, 'processing', 'error', str(e)
+                    document_id, 'legal_processing', 'error', str(e)
                 )
             return None
     
     def get_processing_stats(self) -> Dict:
         """
-        Obtém estatísticas detalhadas do processamento do banco de dados
+        Obtém estatísticas detalhadas do processamento
         
         Returns:
             Dicionário com estatísticas
@@ -1034,22 +1445,23 @@ class SmartRAGProcessor:
         finally:
             self.db_manager.disconnect()
 
-# Script SQL atualizado para incluir campos necessários
-def create_updated_database_schema():
+# Schema SQL atualizado para documentos jurídicos
+def create_legal_database_schema():
     """
-    Retorna o script SQL atualizado para suportar detecção de mudanças
+    Retorna o script SQL para documentos jurídicos com capítulos
     """
     return """
-    -- Tabela para armazenar informações dos documentos originais (ATUALIZADA)
+    -- Tabela para armazenar informações dos documentos jurídicos
     CREATE TABLE IF NOT EXISTS documents (
         id INT AUTO_INCREMENT PRIMARY KEY,
-        file_path VARCHAR(1000) UNIQUE NOT NULL,    -- Caminho completo do arquivo
+        file_path VARCHAR(1000) UNIQUE NOT NULL,
         file_name VARCHAR(500) NOT NULL,
         file_type VARCHAR(50) NOT NULL,
         file_size BIGINT,
         content_length INT,
-        file_hash VARCHAR(32) NOT NULL,             -- Hash MD5 do arquivo
-        modification_timestamp DOUBLE NOT NULL,     -- Timestamp de modificação do arquivo
+        file_hash VARCHAR(32) NOT NULL,
+        modification_timestamp DOUBLE NOT NULL,
+        chapters_count INT DEFAULT 0,
         upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         last_processed TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         status ENUM('pending', 'processed', 'error') DEFAULT 'pending',
@@ -1057,10 +1469,31 @@ def create_updated_database_schema():
         INDEX idx_file_path (file_path),
         INDEX idx_file_hash (file_hash),
         INDEX idx_modification_timestamp (modification_timestamp),
-        INDEX idx_status (status)
+        INDEX idx_status (status),
+        INDEX idx_chapters_count (chapters_count)
     );
 
-    -- Tabela para armazenar os chunks gerados (INALTERADA)
+    -- Tabela para armazenar informações dos capítulos detectados
+    CREATE TABLE IF NOT EXISTS document_chapters (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        document_id INT NOT NULL,
+        chapter_index INT NOT NULL,
+        title VARCHAR(500) NOT NULL,
+        chapter_type ENUM('CAPITULO', 'SECAO', 'SUBSECAO', 'ARTIGO', 'DISPOSITIVO', 'FUNDAMENTACAO', 'TITULO', 'DOCUMENTO') NOT NULL,
+        level INT NOT NULL,
+        start_position INT NOT NULL,
+        end_position INT,
+        content_preview TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        
+        FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
+        INDEX idx_document_chapters (document_id, chapter_index),
+        INDEX idx_chapter_type (chapter_type),
+        INDEX idx_chapter_level (level),
+        FULLTEXT INDEX idx_chapter_title (title)
+    );
+
+    -- Tabela para armazenar os chunks organizados por capítulos
     CREATE TABLE IF NOT EXISTS document_chunks (
         id INT AUTO_INCREMENT PRIMARY KEY,
         document_id INT NOT NULL,
@@ -1070,15 +1503,23 @@ def create_updated_database_schema():
         start_position INT NOT NULL,
         end_position INT NOT NULL,
         overlap_size INT DEFAULT 0,
+        chapter_title VARCHAR(500),
+        chapter_type ENUM('CAPITULO', 'SECAO', 'SUBSECAO', 'ARTIGO', 'DISPOSITIVO', 'FUNDAMENTACAO', 'TITULO', 'DOCUMENTO'),
+        chapter_level INT,
+        absolute_start_position INT,
+        absolute_end_position INT,
+        is_chapter_complete BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         
         FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
         INDEX idx_document_id (document_id),
         INDEX idx_chunk_index (document_id, chunk_index),
-        FULLTEXT INDEX idx_content (content)
+        INDEX idx_chapter_info (chapter_type, chapter_level),
+        FULLTEXT INDEX idx_content (content),
+        FULLTEXT INDEX idx_chapter_title (chapter_title)
     );
 
-    -- Tabela para armazenar metadados adicionais dos chunks (INALTERADA)
+    -- Tabela para armazenar metadados adicionais dos chunks
     CREATE TABLE IF NOT EXISTS chunk_metadata (
         id INT AUTO_INCREMENT PRIMARY KEY,
         chunk_id INT NOT NULL,
@@ -1089,7 +1530,7 @@ def create_updated_database_schema():
         INDEX idx_chunk_metadata (chunk_id, metadata_key)
     );
 
-    -- Tabela para logs de processamento (INALTERADA)
+    -- Tabela para logs de processamento
     CREATE TABLE IF NOT EXISTS processing_logs (
         id INT AUTO_INCREMENT PRIMARY KEY,
         document_id INT,
@@ -1100,7 +1541,8 @@ def create_updated_database_schema():
         
         FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE SET NULL,
         INDEX idx_document_logs (document_id),
-        INDEX idx_operation (operation)
+        INDEX idx_operation (operation),
+        INDEX idx_status (status)
     );
     """
 
@@ -1108,99 +1550,123 @@ def create_updated_database_schema():
 if __name__ == "__main__":
     # Configurações do banco de dados
     db_config = {
-        'host': 'endereco_server',
-        'database': 'db_chucking_civel',
-        'user': 'root',
-        'password': 'senha',
+        'host': 'localhost',
+        'database': 'legal_rag_database',
+        'user': 'seu_usuario',
+        'password': 'sua_senha',
         'port': 3306
     }
     
-    # Pasta com os documentos (ALTERE ESTE CAMINHO)
-    documents_folder = "G:/Drives compartilhados/GABINETE CÍVEL DNO/JUDICIAL - DOCUMENTOS PADRÃO"
+    # Configurações
+    documents_folder = "C:/Caminho/Para/Documentos/Juridicos"
+    gemini_api_key = "SUA_CHAVE_API_GEMINI"  # Obtenha em https://makersuite.google.com/app/apikey
 
     try:
-        # Inicializa o processador inteligente
-        processor = SmartRAGProcessor(
+        # Inicializa o processador de documentos jurídicos
+        processor = LegalRAGProcessor(
             db_config=db_config,
             documents_folder=documents_folder,
+            gemini_api_key=gemini_api_key,
             chunk_size=1000,  # Tamanho do chunk em caracteres
             overlap=200       # Sobreposição em caracteres
         )
         
-        print("\nIniciando processamento inteligente dos documentos...")
-        print("O sistema irá:")
-        print("- Verificar se cada arquivo já existe no banco")
-        print("- Detectar mudanças nos arquivos existentes")
-        print("- Processar apenas arquivos novos ou modificados")
-        print("- Pular arquivos que não foram alterados")
+        print("\n" + "="*80)
+        print("SISTEMA DE PROCESSAMENTO DE DOCUMENTOS JURÍDICOS")
+        print("="*80)
+        print("Funcionalidades:")
+        print("- Detecção automática de capítulos usando IA (Gemini)")
+        print("- Chunking organizado por capítulos")
+        print("- Suporte a despachos, decisões e sentenças")
+        print("- Detecção inteligente de mudanças")
+        print("- Estrutura hierárquica de documentos")
         
-        # Processa documentos com detecção inteligente de mudanças
+        # Processa documentos jurídicos
         stats = processor.process_documents(
             file_types=['pdf', 'docx', 'txt'],  # Tipos de arquivo
-            recursive=True,                      # Busca recursiva ATIVADA
+            recursive=True,                      # Busca recursiva
             max_depth=None,                      # Sem limite de profundidade
             show_progress=True                   # Mostrar progresso
         )
         
         # Exibe estatísticas detalhadas
-        print("\n" + "="*70)
-        print("ESTATÍSTICAS FINAIS DO PROCESSAMENTO INTELIGENTE")
-        print("="*70)
+        print("\n" + "="*80)
+        print("ESTATÍSTICAS DO PROCESSAMENTO DE DOCUMENTOS JURÍDICOS")
+        print("="*80)
         print(f"Tempo total de processamento: {stats['processing_time']} segundos")
         print(f"Pastas escaneadas: {stats['folders_scanned']}")
-        print(f"Total de arquivos encontrados: {stats['total_files']}")
-        print(f"Arquivos novos processados: {stats['new_files']}")
-        print(f"Arquivos atualizados: {stats['updated_files']}")
-        print(f"Arquivos inalterados (pulados): {stats['unchanged_files']}")
-        print(f"Arquivos com erro: {stats['failed_files']}")
+        print(f"Total de documentos encontrados: {stats['total_files']}")
+        print(f"Documentos novos processados: {stats['new_files']}")
+        print(f"Documentos atualizados: {stats['updated_files']}")
+        print(f"Documentos inalterados (pulados): {stats['unchanged_files']}")
+        print(f"Documentos com erro: {stats['failed_files']}")
+        print(f"Total de capítulos detectados: {stats['total_chapters']}")
         print(f"Total de chunks criados: {stats['total_chunks']}")
         
         if stats['files_by_type']:
-            print(f"\nArquivos encontrados por tipo:")
+            print(f"\nDocumentos por tipo:")
             for file_type, count in stats['files_by_type'].items():
                 if count > 0:
-                    print(f"  - .{file_type}: {count} arquivos")
+                    print(f"  - .{file_type}: {count} documentos")
         
         if stats['errors']:
             print(f"\nErros encontrados ({len(stats['errors'])}):")
-            for error in stats['errors'][:5]:  # Mostra apenas os primeiros 5
+            for error in stats['errors'][:3]:  # Mostra apenas os primeiros 3
                 print(f"  - {error}")
-            if len(stats['errors']) > 5:
-                print(f"  ... e mais {len(stats['errors']) - 5} erros")
+            if len(stats['errors']) > 3:
+                print(f"  ... e mais {len(stats['errors']) - 3} erros")
         
         # Obtém e exibe estatísticas do banco de dados
-        print("\n" + "="*70)
-        print("ESTATÍSTICAS DO BANCO DE DADOS")
-        print("="*70)
+        print("\n" + "="*80)
+        print("ESTATÍSTICAS DO BANCO DE DADOS JURÍDICOS")
+        print("="*80)
         
         db_stats = processor.get_processing_stats()
         if db_stats:
             print(f"Total de documentos no banco: {db_stats['total_documents']}")
             print(f"Documentos processados: {db_stats['processed_documents']}")
+            print(f"Total de capítulos no banco: {db_stats['total_chapters']}")
             print(f"Total de chunks no banco: {db_stats['total_chunks']}")
             print(f"Tamanho médio dos chunks: {db_stats['avg_chunk_size']} caracteres")
             print(f"Menor chunk: {db_stats['min_chunk_size']} caracteres")
             print(f"Maior chunk: {db_stats['max_chunk_size']} caracteres")
+            
+            if db_stats['chunks_by_chapter_type']:
+                print(f"\nChunks por tipo de capítulo:")
+                for chapter_type, count in db_stats['chunks_by_chapter_type'].items():
+                    print(f"  - {chapter_type}: {count} chunks")
             
             if db_stats['file_types']:
                 print(f"\nTipos de arquivo no banco:")
                 for file_type, count in db_stats['file_types'].items():
                     print(f"  - {file_type}: {count} documentos")
         
-        print("="*70)
-        print("PROCESSAMENTO INTELIGENTE CONCLUÍDO COM SUCESSO!")
-        print("="*70)
-        print("\nPróximas execuções serão mais rápidas, pois apenas")
-        print("arquivos novos ou modificados serão processados!")
+        print("="*80)
+        print("PROCESSAMENTO DE DOCUMENTOS JURÍDICOS CONCLUÍDO!")
+        print("="*80)
+        print("\nRecursos implementados:")
+        print("✓ Detecção automática de capítulos com IA")
+        print("✓ Chunking organizado por estrutura jurídica")
+        print("✓ Suporte a despachos, decisões e sentenças")
+        print("✓ Detecção inteligente de mudanças")
+        print("✓ Busca recursiva em subpastas")
+        print("✓ Logs detalhados de processamento")
+        print("\nPróximas execuções processarão apenas documentos novos ou modificados!")
         
     except Exception as e:
         logger.error(f"Erro fatal no processamento: {e}")
         print(f"\nERRO FATAL: {e}")
         print("Verifique as configurações e tente novamente.")
+        print("\nVerifique se:")
+        print("1. A chave da API do Gemini está correta")
+        print("2. O banco de dados está acessível")
+        print("3. A pasta de documentos existe")
+        print("4. As dependências estão instaladas:")
+        print("   pip install google-generativeai mysql-connector-python PyPDF2 python-docx")
 
-    # Exibe o schema SQL atualizado
-    print("\n" + "="*70)
-    print("SCHEMA SQL ATUALIZADO PARA DETECÇÃO DE MUDANÇAS")
-    print("="*70)
-    print("Execute este SQL no seu banco de dados se ainda não executou:")
-    print(create_updated_database_schema())
+    # Exibe o schema SQL para documentos jurídicos
+    print("\n" + "="*80)
+    print("SCHEMA SQL PARA DOCUMENTOS JURÍDICOS")
+    print("="*80)
+    print("Execute este SQL no seu banco de dados:")
+    print(create_legal_database_schema())
